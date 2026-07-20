@@ -12,13 +12,21 @@ The script processes each selected file in this order:
 
 1. Load time and force/thrust data.
 2. Detect the sampling rate from the time column.
-3. Estimate a drifting baseline from the lower envelope of the signal.
-4. Subtract the baseline to create a debiased signal.
-5. Apply a low-pass filter to suppress noise.
-6. Use FFT to estimate the dominant cycle period.
-7. Detect peaks and their preceding baseline points for each cycle.
-8. Compute per-cycle and per-file thrust statistics.
+3. Use FFT to estimate the dominant cycle period.
+4. Fold complete cycles onto a common phase grid.
+5. Separate each cycle into a repeating waveform, changing amplitude, and a
+   slowly varying additive sensor offset.
+6. Subtract only the additive sensor drift; keep both positive thrust and
+   negative recovery resistance.
+7. Apply a low-pass filter for peak/valley display.
+8. Integrate adjacent peak-to-peak cycles without overlapping intervals.
 9. Export plots and a batch summary table.
+
+The dynamic baseline is not calculated from minima, valleys, or a 5th
+percentile. The initial repeated-timestamp samples (or the first sample) are
+used as a pre-actuation tare reference, and the first stable cycles calibrate
+the waveform template. This is important when a recovery stroke creates real
+negative force.
 
 ## Run
 
@@ -93,17 +101,16 @@ Meaning:
 
 ### Analysis Options
 
-- `Auto-detect peak parameters`
-  - automatically adjusts peak-detection sensitivity from signal quality
-  - recommended for most datasets
+- `FFT cycle-template detection: enabled`
+  - cycle frequency and spacing are determined automatically
 
 - `Processed Signal (Recommended)`
-  - uses the filtered, baseline-corrected signal to measure cycle peaks and baselines
+  - uses the filtered, drift-corrected signal to measure cycle peaks and recovery valleys
   - better for noisy data and routine reporting
 
 - `Original Signal`
-  - uses the raw signal values at detected cycle locations
-  - useful when you want raw measured amplitudes instead of filtered values
+  - uses unfiltered but drift-corrected values at detected cycle locations
+  - useful when you want measured amplitude detail without low-pass smoothing
 
 - `Low-pass Cutoff (Hz)`
   - the cutoff frequency of the low-pass filter applied after baseline removal
@@ -137,18 +144,18 @@ Each file generates:
 
 The SVG contains six panels:
 
-1. `Original Data & Baseline`
-   - raw force signal and estimated baseline curve
-2. `Baseline Removed`
-   - debiased signal, computed as `force_raw - baseline_curve`
+1. `Raw Data & Dynamic Sensor Baseline`
+   - raw force signal and the slowly varying load-cell offset
+2. `Drift Removed (Signed Force Preserved)`
+   - corrected signal, computed as `force_raw - sensor_baseline`
 3. `Low-Pass Filter`
    - debiased signal plus filtered signal
 4. `Removed Noise`
    - the difference between debiased and filtered signals
 5. `Cycle Detection`
-   - filtered signal with detected peaks and baselines marked
-6. `Thrust vs Drag`
-   - bar chart of cycle peak values and baseline-side values
+   - filtered signal with thrust peaks and signed recovery valleys marked
+6. `Peak Thrust & Signed Recovery Force`
+   - bar chart of cycle peak values and recovery values; recovery may be negative
 
 ### Exported Summary Table
 
@@ -162,12 +169,17 @@ The batch summary includes these columns:
 - `Forward`
 - `Backward`
 - `Mean_Thrust(N)`
-- `Mean_Drag(N)`
+- `Mean_Recovery_Force(N)`
+- `Mean_Cycle_Force(N)`
 - `Mean_Net(N)`
 - `Std_Net(N)`
 - `Mean_Impulse(N*s)`
 - `Total_Impulse(N*s)`
 - `Detected_Period(s)`
+- `Detected_Frequency(Hz)`
+- `Baseline_Start(N)`
+- `Baseline_End(N)`
+- `Baseline_Drift(N)`
 
 ## What Each Result Means
 
@@ -222,16 +234,8 @@ Cycles = len(cycle_results)
 
 Meaning:
 
-- the number of valid thrust cycles detected in the file
-
-Important note:
-
-- only cycles with positive net thrust are kept
-- a candidate cycle is accepted only if:
-
-```text
-net_thrust = peak_value - baseline_value > 0
-```
+- the number of complete peak-to-peak cycles detected in the file
+- cycles are retained regardless of impulse sign
 
 ### `Forward`
 
@@ -275,22 +279,36 @@ Meaning:
 
 - the average peak force level across all detected cycles
 
-### `Mean_Drag(N)`
+### `Mean_Recovery_Force(N)`
 
 Computed as:
 
 ```text
-Mean_Drag = mean(baseline_value for each detected cycle)
+Mean_Recovery_Force = mean(recovery_value for each detected cycle)
 ```
 
 Where:
 
-- `baseline_value` is the valley or pre-peak reference value chosen for that cycle
+- `recovery_value` is the signed minimum after sensor-drift removal
 
 Meaning:
 
-- the average baseline-side force level before each thrust peak
-- depending on the experiment, this may represent drag-side force, preload, or the low-force phase of a cycle
+- a negative value represents measured recovery resistance
+- a value close to zero represents little recovery resistance
+- it is never used to define the sensor baseline
+
+### `Mean_Cycle_Force(N)`
+
+For every complete cycle:
+
+```text
+cycle_mean_force = cycle_impulse / cycle_duration
+```
+
+Meaning:
+
+- the signed time-average force produced over a full cycle
+- unlike peak-to-valley amplitude, it includes both thrust and recovery phases
 
 ### `Mean_Net(N)`
 
@@ -299,7 +317,7 @@ Computed in two steps.
 First, for each cycle:
 
 ```text
-net_thrust = peak_value - baseline_value
+net_thrust = peak_value - recovery_value
 ```
 
 Then:
@@ -329,10 +347,11 @@ Meaning:
 
 ### `Mean_Impulse(N*s)`
 
-For each cycle, the script computes impulse from the processed signal:
+For each cycle, the script computes impulse from the unfiltered,
+drift-corrected signal:
 
 ```text
-impulse = trapz(y_processed[cycle_start:cycle_end], t[cycle_start:cycle_end])
+impulse = trapz(corrected_force[peak_i:peak_i+1], t[peak_i:peak_i+1])
 ```
 
 Then:
@@ -356,11 +375,12 @@ Total_Impulse = sum(impulse for all detected cycles)
 
 Meaning:
 
-- the total integrated thrust contribution across the whole analyzed recording
+- the total integrated force across all complete, non-overlapping cycles
 
 ### `Detected_Period(s)`
 
-Computed with FFT on the processed signal:
+Computed with FFT after resampling the raw signal onto a uniform time grid and
+removing its linear trend:
 
 ```text
 Detected_Period = 1 / dominant_frequency
@@ -382,41 +402,44 @@ Depends on measurement mode:
 - processed mode:
   - peak value comes from the filtered/debiased signal
 - original mode:
-  - peak value comes from the raw signal
+  - peak value comes from the unfiltered, drift-corrected signal
 
-### `baseline_value`
+### `recovery_value`
 
-For each peak, the script searches backward to find a low point before that peak and uses it as the cycle baseline.
+For each complete peak-to-peak cycle, this is the minimum signed force after
+dynamic sensor-drift removal.
 
 Meaning:
 
-- this is the local reference value used to compute net thrust for that cycle
+- this is a physical recovery-force measurement, not a baseline estimate
 
 ### `net_thrust`
 
 Defined as:
 
 ```text
-net_thrust = peak_value - baseline_value
+net_thrust = peak_value - recovery_value
 ```
 
 Meaning:
 
-- the cycle amplitude relative to its baseline
-- only cycles with positive net thrust are kept
+- the peak-to-valley cycle amplitude
 
 ### `impulse`
 
-Defined as the numerical integral of the processed signal over the cycle interval:
+Defined as the numerical integral of the unfiltered, drift-corrected signal
+over the cycle interval:
 
 ```text
-impulse = trapz(processed_signal over cycle)
+impulse = trapz(corrected_force over cycle)
 ```
 
 Meaning:
 
-- area under the processed force-time curve for that cycle
+- area under the drift-corrected force-time curve for that cycle
 - a combined measure of force magnitude and duration
+- adjacent cycle intervals share an endpoint but no time interval, so their
+  impulses sum exactly to the integral over the covered span
 
 ## Output Interpretation Tips
 
@@ -431,11 +454,14 @@ If you want to compare datasets:
 If you want to judge measurement quality:
 
 - inspect the SVG panels for baseline drift and noise
-- compare `Mean_Thrust`, `Mean_Drag`, and `Mean_Net`
+- compare `Mean_Thrust`, `Mean_Recovery_Force`, `Mean_Cycle_Force`, and `Mean_Net`
 - watch for large `Std_Net` if the cycles are inconsistent
 
 ## Notes
 
 - SVG files are saved in the same source-folder tree under `thrust_analysis_results`
 - when multiple folders are selected, each folder receives its own summary file
-- the script tries to be robust to noisy data by combining baseline estimation, low-pass filtering, FFT period detection, and fallback cycle detection
+- absolute mean force and absolute sensor offset are not identifiable from a
+  periodic signal alone. The method therefore requires the recording to start
+  with a valid pre-actuation tare sample (the file format may repeat its initial
+  timestamp).

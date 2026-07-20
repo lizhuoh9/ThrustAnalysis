@@ -13,6 +13,8 @@ import threading
 import warnings
 warnings.filterwarnings('ignore')
 
+from dynamic_baseline import analyze_dynamic_baseline, lowpass_irregular_signal
+
 # Set up matplotlib for English
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
@@ -252,8 +254,11 @@ class ThrustAnalyzerGUI:
         adv_frame.columnconfigure(0, weight=1)
         adv_frame.columnconfigure(1, weight=1)
         
-        ttk.Checkbutton(adv_frame, text="Auto-detect peak parameters", 
-                       variable=self.auto_mode, command=self.toggle_auto_mode).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(
+            adv_frame,
+            text="FFT cycle-template detection: enabled",
+            style='Muted.TLabel'
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W)
         
         # Signal choice
         ttk.Label(adv_frame, text="Measurement Signal", style='Muted.TLabel').grid(
@@ -399,11 +404,11 @@ class ThrustAnalyzerGUI:
         """Explain the currently selected signal mode."""
         if self.use_processed_signal.get():
             self.signal_mode_hint_var.set(
-                "Using the filtered signal for peak and baseline measurement. This is recommended for most runs."
+                "Using the filtered, drift-corrected signal for peak and recovery-force measurement."
             )
         else:
             self.signal_mode_hint_var.set(
-                "Using the original signal. Keep this only when raw amplitude matters more than noise suppression."
+                "Using the unfiltered, drift-corrected signal when amplitude detail matters more than noise suppression."
             )
 
     def set_status(self, text, tone='success', detail=''):
@@ -775,12 +780,15 @@ class ThrustAnalyzerGUI:
                         'Forward': r.get('forward_cycles', 'N/A'),
                         'Backward': r.get('backward_cycles', 'N/A'),
                         'Mean_Thrust(N)': f"{r['mean_thrust']:.4f}",
-                        'Mean_Drag(N)': f"{r['mean_drag']:.4f}",
+                        'Mean_Recovery_Force(N)': f"{r['mean_recovery_force']:.4f}",
+                        'Mean_Cycle_Force(N)': f"{r['mean_cycle_force']:.4f}",
                         'Mean_Net(N)': f"{r['mean_net_thrust']:.4f}",
                         'Std_Net(N)': f"{r['std_net_thrust']:.4f}",
                         'Mean_Impulse(N·s)': f"{r.get('mean_impulse', 0):.6f}",
                         'Total_Impulse(N·s)': f"{r.get('total_impulse', 0):.6f}",
-                        'Detected_Period(s)': f"{r['detected_period']:.3f}" if r.get('detected_period') else 'N/A'
+                        'Detected_Period(s)': f"{r['detected_period']:.3f}" if r.get('detected_period') else 'N/A',
+                        'Detected_Frequency(Hz)': f"{r['detected_frequency']:.4f}",
+                        'Baseline_Drift(N)': f"{r['baseline_drift']:.4f}"
                     })
                 
                 summary_df = self.build_summary_dataframe(all_results)
@@ -840,6 +848,8 @@ class ThrustAnalyzerGUI:
                 'File': r.get('file_name', 'N/A'),
                 'Cycles': r.get('num_cycles', 0),
                 'Mean Net(N)': f"{r.get('mean_net_thrust', 0):.4f}",
+                'Mean Cycle Force(N)': f"{r.get('mean_cycle_force', 0):.4f}",
+                'Mean Recovery(N)': f"{r.get('mean_recovery_force', 0):.4f}",
                 'Mean Impulse': f"{r.get('mean_impulse', 0):.6f}",
                 'Detected Period(s)': f"{r.get('detected_period', 0):.3f}" if r.get('detected_period') else 'N/A'
             }
@@ -865,12 +875,17 @@ class ThrustAnalyzerGUI:
                 'Forward': r.get('forward_cycles', 'N/A'),
                 'Backward': r.get('backward_cycles', 'N/A'),
                 'Mean_Thrust(N)': f"{r['mean_thrust']:.4f}",
-                'Mean_Drag(N)': f"{r['mean_drag']:.4f}",
+                'Mean_Recovery_Force(N)': f"{r['mean_recovery_force']:.4f}",
+                'Mean_Cycle_Force(N)': f"{r['mean_cycle_force']:.4f}",
                 'Mean_Net(N)': f"{r['mean_net_thrust']:.4f}",
                 'Std_Net(N)': f"{r['std_net_thrust']:.4f}",
                 'Mean_Impulse(N路s)': f"{r.get('mean_impulse', 0):.6f}",
                 'Total_Impulse(N路s)': f"{r.get('total_impulse', 0):.6f}",
-                'Detected_Period(s)': f"{r['detected_period']:.3f}" if r.get('detected_period') else 'N/A'
+                'Detected_Period(s)': f"{r['detected_period']:.3f}" if r.get('detected_period') else 'N/A',
+                'Detected_Frequency(Hz)': f"{r['detected_frequency']:.4f}",
+                'Baseline_Start(N)': f"{r['baseline_start']:.4f}",
+                'Baseline_End(N)': f"{r['baseline_end']:.4f}",
+                'Baseline_Drift(N)': f"{r['baseline_drift']:.4f}"
             })
         return pd.DataFrame(summary_data)
 
@@ -909,6 +924,7 @@ class ProfessionalThrustAnalyzer:
         self.auto_mode = auto_mode
         self.adaptive_period = adaptive_period
         self.use_processed_signal = use_processed_signal
+        self.dynamic_baseline_result = None
     
     def load_data(self, file_path):
         """Load data from file"""
@@ -1018,73 +1034,65 @@ class ProfessionalThrustAnalyzer:
             return 1.0  # Default fallback
     
     def process_signal(self, force_raw, cutoff_freq, t=None):
-        """Signal processing with improved baseline detection
-        
-        Baseline strategy:
-        1. Use first N seconds (before motion) as initial baseline reference
-        2. Track drift using rolling low percentile (5th percentile)
-        3. Smoothly interpolate to create continuous baseline curve
-        """
-        nyquist = 0.5 * self.fs
-        n = len(force_raw)
-        
-        # Step 1: Determine initial baseline from quiet period (first 2 seconds or 10% of data)
-        quiet_samples = min(int(2.0 * self.fs), int(n * 0.1), max(10, int(n * 0.05)))
-        initial_baseline = np.median(force_raw[:quiet_samples])
-        initial_std = np.std(force_raw[:quiet_samples])
-        
-        self.log(f"  Initial baseline (first {quiet_samples} samples): {initial_baseline:.4f} N (std: {initial_std:.4f})")
-        
-        # Step 2: Use rolling low percentile to track baseline drift
-        # Window size: approximately 2 cycle periods or 20% of data
-        window_samples = min(int(4.0 * self.fs), int(n * 0.2))
-        window_samples = max(window_samples, 50)  # At least 50 samples
-        
-        # Calculate rolling 5th percentile (captures the "rest" valleys)
-        half_window = window_samples // 2
-        baseline_curve = np.zeros(n)
-        
-        for i in range(n):
-            start = max(0, i - half_window)
-            end = min(n, i + half_window)
-            window_data = force_raw[start:end]
-            # Use 5th percentile to find the bottom envelope (rest baseline)
-            baseline_curve[i] = np.percentile(window_data, 5)
-        
-        # Step 3: For the initial quiet period, use the initial baseline value
-        # (don't let percentile be affected by motion that may start later in window)
-        baseline_curve[:quiet_samples] = initial_baseline
-        
-        # Step 4: Smooth the baseline curve to avoid jumps
-        from scipy.ndimage import uniform_filter1d
-        smooth_window = max(int(0.5 * self.fs), 5)
-        baseline_curve = uniform_filter1d(baseline_curve, size=smooth_window)
-        
-        # Report baseline drift
+        """Separate slow sensor drift from the signed periodic force waveform."""
+        if t is None:
+            t = np.arange(len(force_raw), dtype=float) / self.fs
+        result = analyze_dynamic_baseline(t, force_raw)
+        self.dynamic_baseline_result = result
+        self.fs = result.sampling_rate_hz
+        self.dt = 1.0 / self.fs
+        baseline_curve = np.asarray(result.baseline)
+        force_debiased = np.asarray(result.corrected_force)
+
+        self.log(f"  FFT frequency: {result.frequency_hz:.4f} Hz ({result.period_s:.4f} s)")
+        self.log(f"  Pre-actuation baseline anchor: {result.baseline_anchor_n:.4f} N")
         baseline_min = np.min(baseline_curve)
         baseline_max = np.max(baseline_curve)
         baseline_drift = baseline_max - baseline_min
         self.log(f"  Baseline range: [{baseline_min:.4f}, {baseline_max:.4f}] N, drift: {baseline_drift:.4f} N")
-        
-        # =============================================================
-        # SIGNAL DEBIASING AND FILTERING
-        # =============================================================
-        force_debiased = force_raw - baseline_curve
-        
+
+        nyquist = 0.5 * self.fs
         # Low-pass filter for noise removal
         max_cutoff = nyquist * 0.95
         if cutoff_freq >= max_cutoff:
             cutoff_freq = max_cutoff * 0.8
             self.log(f"  Cutoff adjusted to: {cutoff_freq:.2f} Hz")
         
-        normal_cutoff = cutoff_freq / nyquist
-        b, a = butter(4, normal_cutoff, btype='low')
-        force_filtered = filtfilt(b, a, force_debiased)
+        force_filtered = lowpass_irregular_signal(
+            t, force_debiased, self.fs, cutoff_freq
+        )
         
         return force_debiased, force_filtered, baseline_curve
     
     def detect_cycles_with_fallback(self, t, y_original, y_processed):
-        """Detect cycles with auto period detection and fallback algorithms"""
+        """Build signed, non-overlapping cycle statistics from the drift result."""
+        result = self.dynamic_baseline_result
+        if result is not None and len(result.corrected_force) == len(t):
+            measurement = y_processed if self.use_processed_signal else y_original
+            thrust_cycles = []
+            for index, (start, stop) in enumerate(
+                zip(result.cycle_boundaries[:-1], result.cycle_boundaries[1:])
+            ):
+                cycle_values = measurement[int(start) : int(stop)]
+                peak_idx = int(start + np.argmax(cycle_values))
+                valley_idx = int(start + np.argmin(cycle_values))
+                peak_val = float(measurement[peak_idx])
+                valley_val = float(measurement[valley_idx])
+                thrust_cycles.append({
+                    'cycle_start_idx': int(start),
+                    'cycle_end_idx': int(stop),
+                    'peak_idx': peak_idx,
+                    'baseline_idx': valley_idx,
+                    'valley_idx': valley_idx,
+                    'peak_value': peak_val,
+                    'baseline_value': valley_val,
+                    'recovery_value': valley_val,
+                    'net_thrust': peak_val - valley_val,
+                    'mean_force': float(result.cycle_mean_forces[index]),
+                    'impulse': float(result.cycle_impulses[index])
+                })
+            self.log(f"  Detected {len(thrust_cycles)} complete, non-overlapping cycles")
+            return thrust_cycles, result.period_s
         
         # Auto-detect period using FFT (no user input needed)
         actual_period = self.estimate_actual_period(t, y_processed, None)
@@ -1232,9 +1240,9 @@ class ProfessionalThrustAnalyzer:
         # Panel 1: Original + baseline
         ax1 = plt.subplot(3, 2, 1)
         ax1.plot(t, force_raw, 'b-', linewidth=0.8, alpha=0.6, label='Raw')
-        ax1.plot(t, baseline_curve, 'r-', linewidth=2, label='Baseline')
+        ax1.plot(t, baseline_curve, 'r-', linewidth=2, label='Dynamic sensor baseline')
         ax1.set_ylabel('Force (N)')
-        ax1.set_title('Original Data & Baseline')
+        ax1.set_title('Raw Data & Dynamic Sensor Baseline')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
@@ -1244,7 +1252,7 @@ class ProfessionalThrustAnalyzer:
         ax2.plot(t, force_debiased, 'g-', linewidth=0.8, alpha=0.6)
         ax2.axhline(y=0, color='k', linestyle=':', alpha=0.5)
         ax2.set_ylabel('Force (N)')
-        ax2.set_title('Baseline Removed')
+        ax2.set_title('Drift Removed (Signed Force Preserved)')
         ax2.grid(True, alpha=0.3)
         
         # Panel 3: Filtered
@@ -1270,9 +1278,9 @@ class ProfessionalThrustAnalyzer:
         
         for cycle in cycle_results:
             peak_idx = cycle['peak_idx']
-            base_idx = cycle['baseline_idx']
+            base_idx = cycle['valley_idx']
             ax5.plot(t[peak_idx], force_filtered[peak_idx], 'ro', markersize=8)
-            ax5.plot(t[base_idx], force_filtered[base_idx], 'go', markersize=6)
+            ax5.plot(t[base_idx], force_filtered[base_idx], 'mo', markersize=6)
         
         ax5.axhline(y=0, color='k', linestyle='-', alpha=0.5)
         ax5.set_xlabel('Time (s)')
@@ -1285,17 +1293,17 @@ class ProfessionalThrustAnalyzer:
         if cycle_results:
             cycle_nums = range(1, len(cycle_results)+1)
             thrusts = [c['peak_value'] for c in cycle_results]
-            drags = [-c['baseline_value'] for c in cycle_results]
+            recoveries = [c['recovery_value'] for c in cycle_results]
             
             width = 0.35
             x = np.arange(len(cycle_nums))
             
             ax6.bar(x - width/2, thrusts, width, label='Thrust', color='green', alpha=0.7)
-            ax6.bar(x + width/2, drags, width, label='Drag', color='red', alpha=0.7)
+            ax6.bar(x + width/2, recoveries, width, label='Recovery force', color='red', alpha=0.7)
             ax6.axhline(y=0, color='k', linestyle='-', linewidth=1)
             ax6.set_xlabel('Cycle')
             ax6.set_ylabel('Force (N)')
-            ax6.set_title('Thrust vs Drag')
+            ax6.set_title('Peak Thrust & Signed Recovery Force')
             ax6.legend()
         ax6.grid(True, alpha=0.3)
         
@@ -1319,11 +1327,13 @@ class ProfessionalThrustAnalyzer:
         self.log(f"  Data: {len(force_raw)} points, {t[-1]:.2f}s")
         
         # Signal processing
-        force_debiased, force_filtered, baseline_curve = self.process_signal(force_raw, cutoff_freq)
+        force_debiased, force_filtered, baseline_curve = self.process_signal(
+            force_raw, cutoff_freq, t=t
+        )
         
         # Cycle detection with auto period detection
         cycle_results, detected_period = self.detect_cycles_with_fallback(
-            t, force_raw, force_filtered
+            t, force_debiased, force_filtered
         )
         
         if not cycle_results:
@@ -1335,11 +1345,14 @@ class ProfessionalThrustAnalyzer:
         impulses = [c['impulse'] for c in cycle_results]
         peak_values = [c['peak_value'] for c in cycle_results]
         base_values = [c['baseline_value'] for c in cycle_results]
+        mean_forces = [c['mean_force'] for c in cycle_results]
         
         forward_cycles = sum(1 for imp in impulses if imp > 0)
         
         self.log(f"  Detected {len(cycle_results)} cycles")
         self.log(f"  Mean net thrust: {np.mean(net_thrusts):.4f} N")
+        self.log(f"  Mean cycle force: {np.mean(mean_forces):.4f} N")
+        self.log(f"  Mean signed recovery force: {np.mean(base_values):.4f} N")
         self.log(f"  Forward: {forward_cycles}/{len(cycle_results)}")
         
         # Create output directory
@@ -1363,12 +1376,18 @@ class ProfessionalThrustAnalyzer:
             'backward_cycles': len(cycle_results) - forward_cycles,
             'mean_thrust': np.mean(peak_values),
             'mean_drag': np.mean(base_values),
+            'mean_recovery_force': np.mean(base_values),
             'mean_net_thrust': np.mean(net_thrusts),
+            'mean_cycle_force': np.mean(mean_forces),
             'std_net_thrust': np.std(net_thrusts),
             'mean_impulse': np.mean(impulses),
             'std_impulse': np.std(impulses),
             'total_impulse': np.sum(impulses),
-            'detected_period': detected_period
+            'detected_period': detected_period,
+            'detected_frequency': 1.0 / detected_period,
+            'baseline_start': float(baseline_curve[0]),
+            'baseline_end': float(baseline_curve[-1]),
+            'baseline_drift': float(np.max(baseline_curve) - np.min(baseline_curve))
         }
 
 

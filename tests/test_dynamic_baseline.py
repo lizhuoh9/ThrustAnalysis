@@ -144,6 +144,36 @@ class DynamicBaselineContractTests(unittest.TestCase):
         self.assertGreater(late_peak, 1.8 * early_peak)
         self.assertGreater(float(np.corrcoef(peak_values, amplitude[peak_indices])[0, 1]), 0.95)
 
+    def test_local_nonpolynomial_drift_is_followed_on_a_slow_cycle_scale(self) -> None:
+        sampling_rate_hz = 80.0
+        frequency_hz = 1.25
+        time = np.arange(0.0, 40.0, 1.0 / sampling_rate_hz)
+        bump = 0.030 * np.exp(-((time - 25.0) / 3.5) ** 2)
+        true_baseline = 0.21 + 0.018 * np.sin(2.0 * np.pi * 0.018 * time) + bump
+        true_signal = 0.42 * _positive_pulse(time, frequency_hz)
+
+        result = self.analyze(time, true_baseline + true_signal)
+
+        interior = slice(int(0.10 * time.size), int(0.90 * time.size))
+        error = np.asarray(result.baseline)[interior] - true_baseline[interior]
+        self.assertLess(float(np.sqrt(np.mean(error**2))), 0.007)
+
+    def test_irregular_sampling_is_resampled_before_cycle_detection(self) -> None:
+        nominal_rate_hz = 20.0
+        frequency_hz = 1.25
+        steps = np.concatenate((np.full(400, 0.025), np.full(400, 0.075)))
+        time = np.concatenate(([0.0], np.cumsum(steps)))
+        waveform = 0.46 * _positive_pulse(time, frequency_hz)
+        baseline = 0.18 + 0.0008 * time
+
+        result = self.analyze(time, baseline + waveform)
+
+        self.assertAlmostEqual(result.frequency_hz, frequency_hz, delta=0.03)
+        periods = np.diff(time[np.asarray(result.cycle_boundaries, dtype=int)])
+        self.assertLess(float(np.std(periods)), 0.08)
+        covered_duration = time[result.cycle_boundaries[-1]] - time[result.cycle_boundaries[0]]
+        self.assertGreater(float(covered_duration), 0.80 * float(time[-1] - time[0]))
+
     def test_repeated_initial_timestamps_are_pre_actuation_zero_samples(self) -> None:
         sampling_rate_hz = 120.0
         repeated_zero_count = 6
@@ -164,6 +194,21 @@ class DynamicBaselineContractTests(unittest.TestCase):
         self.assertEqual(corrected.shape, force.shape)
         self.assertLess(float(np.max(np.abs(corrected[:repeated_zero_count]))), 0.03)
         self.assertGreater(float(np.max(corrected[repeated_zero_count:])), 0.48)
+
+    def test_noisy_repeated_timestamp_block_is_never_detected_as_cycles(self) -> None:
+        sampling_rate_hz = 6.0
+        repeated_zero_count = 30
+        active_time = np.arange(1, 361, dtype=float) / sampling_rate_hz
+        time = np.concatenate((np.zeros(repeated_zero_count), active_time))
+        prefix_noise = 0.22 + 0.004 * np.sin(np.arange(repeated_zero_count))
+        active_force = 0.22 + 0.08 * _positive_pulse(active_time, 5.0 / 6.0)
+        force = np.concatenate((prefix_noise, active_force))
+
+        result = self.analyze(time, force)
+
+        boundaries = np.asarray(result.cycle_boundaries, dtype=int)
+        self.assertGreaterEqual(int(boundaries[0]), repeated_zero_count)
+        self.assertAlmostEqual(result.frequency_hz, 5.0 / 6.0, delta=0.03)
 
     def test_cycle_impulses_sum_without_overlapping_intervals(self) -> None:
         sampling_rate_hz = 250.0
@@ -200,6 +245,19 @@ class DynamicBaselineContractTests(unittest.TestCase):
         mean_forces = np.asarray(result.cycle_mean_forces, dtype=float)
         durations = time[boundaries[1:]] - time[boundaries[:-1]]
         np.testing.assert_allclose(mean_forces, impulses / durations, rtol=1e-6, atol=1e-9)
+
+    def test_each_boundary_peak_belongs_to_only_one_cycle(self) -> None:
+        sampling_rate_hz = 200.0
+        frequency_hz = 2.0
+        time = np.arange(0.0, 12.0, 1.0 / sampling_rate_hz)
+        cycle_number = np.floor(frequency_hz * time).astype(int)
+        amplitude = np.where(cycle_number % 2 == 0, 0.30, 0.80)
+        force = 0.20 + amplitude * _positive_pulse(time, frequency_hz)
+
+        result = self.analyze(time, force)
+
+        peak_indices = np.asarray(result.peaks, dtype=int)
+        self.assertEqual(np.unique(peak_indices).size, peak_indices.size)
 
     def test_invalid_and_too_short_inputs_raise_value_error(self) -> None:
         valid_time = np.arange(0.0, 2.0, 0.01)
