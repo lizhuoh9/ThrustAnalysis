@@ -25,7 +25,7 @@ class ThrustAnalyzerGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("Professional Thrust Analysis System V3.0 (Unified)")
+        self.root.title("Sensor Reading Analysis")
         self.root.geometry("1240x820")
         self.root.minsize(1120, 760)
         self.colors = {
@@ -46,6 +46,7 @@ class ThrustAnalyzerGUI:
         }
         
         self.file_paths = []
+        self.last_output_dirs = []
         self.is_processing = False
         self.detected_sampling_rate = None
         
@@ -159,14 +160,14 @@ class ThrustAnalyzerGUI:
         hero_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 12))
         tk.Label(
             hero_frame,
-            text="Thrust Analysis Workspace",
+            text="Sensor Reading Analysis",
             bg=self.colors['accent'],
             fg='white',
             font=('Segoe UI Semibold', 16)
         ).grid(row=0, column=0, sticky=tk.W)
         tk.Label(
             hero_frame,
-            text="Processed signal is selected by default for cleaner, more stable cycle measurement.",
+            text="Remove drift, preserve signed force, and measure repeatable propulsion cycles.",
             bg=self.colors['accent'],
             fg='#d8ecfb',
             font=('Segoe UI', 10)
@@ -301,7 +302,18 @@ class ThrustAnalyzerGUI:
         self.stop_button.grid(row=0, column=1, sticky='ew', padx=(6, 0), pady=(0, 8))
         
         ttk.Button(action_frame, text="Quick Diagnostic", style='Secondary.TButton',
-                  command=self.quick_diagnostic).grid(row=1, column=0, columnspan=2, sticky='ew')
+                  command=self.quick_diagnostic).grid(row=1, column=0, sticky='ew', padx=(0, 6))
+        self.open_results_button = ttk.Button(
+            action_frame, text="Open Results Folder", style='Secondary.TButton',
+            command=self.open_results_folder, state='disabled'
+        )
+        self.open_results_button.grid(row=1, column=1, sticky='ew', padx=(6, 0))
+
+        self.clear_log_button = ttk.Button(
+            action_frame, text="Clear Log", style='Secondary.TButton',
+            command=self.clear_log
+        )
+        self.clear_log_button.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(8, 0))
         
         # Progress Bar
         self.progress = ttk.Progressbar(left_frame, mode='indeterminate', style='Accent.Horizontal.TProgressbar')
@@ -377,12 +389,16 @@ class ThrustAnalyzerGUI:
         
         # Initial welcome message
         self.log("="*70)
-        self.log("Welcome to Professional Thrust Analysis System V3.0 (Unified)")
-        self.log("Combines the best features from both analysis programs")
+        self.log("Welcome to Sensor Reading Analysis")
+        self.log("FFT-guided drift removal with signed recovery-force preservation")
         self.log("="*70)
         self.log("")
         
         self.toggle_auto_mode()
+
+        self.root.bind('<Control-o>', lambda _event: self.select_single_file())
+        self.root.bind('<Control-Return>', lambda _event: self.start_analysis())
+        self.root.bind('<Escape>', lambda _event: self.stop_analysis())
 
     def format_file_display_name(self, file_path):
         """Keep file list entries readable when multiple folders are selected."""
@@ -441,6 +457,26 @@ class ThrustAnalyzerGUI:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+
+    def clear_log(self):
+        """Clear the processing log without changing queued files or settings."""
+        self.log_text.delete('1.0', tk.END)
+        self.log("Log cleared. Ready for the next operation.")
+
+    def open_results_folder(self):
+        """Open the most recently generated result folder in the file manager."""
+        if not self.last_output_dirs:
+            messagebox.showinfo("Results", "Run an analysis first to create a results folder.")
+            return
+        if len(self.last_output_dirs) == 1:
+            os.startfile(self.last_output_dirs[0])
+            return
+        folder_list = "\n".join(str(path) for path in self.last_output_dirs)
+        if messagebox.askyesno(
+            "Multiple result folders",
+            f"Open the first folder?\n\n{folder_list}"
+        ):
+            os.startfile(self.last_output_dirs[0])
         
     def select_single_file(self):
         file_path = filedialog.askopenfilename(
@@ -800,6 +836,8 @@ class ThrustAnalyzerGUI:
                 else:
                     summary_path = Path(f"{len(summary_paths)} summary files")
                 output_dir = summary_paths[0].parent
+                self.last_output_dirs = sorted({path.parent for path in summary_paths}, key=str)
+                self.open_results_button.config(state='normal')
                 
                 self.log(f"\n✅ Summary saved: {summary_path.name}")
                 self.log(f"   Total files: {len(all_results)}")
@@ -814,7 +852,10 @@ class ThrustAnalyzerGUI:
                 self.log("✅ Analysis complete!")
                 self.log("="*70)
                 
-                self.set_status("Complete", "success", f"Finished analyzing {len(all_results)} file(s).")
+                self.set_status(
+                    "Complete", "success",
+                    f"Finished {len(all_results)} file(s); results saved in {len(self.last_output_dirs)} folder(s)."
+                )
                 if len(summary_paths) == 1:
                     summary_message = f"Summary: {summary_paths[0]}"
                 else:
