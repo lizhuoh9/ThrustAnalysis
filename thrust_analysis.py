@@ -3,21 +3,102 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend to avoid threading issues with Tkinter
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt, find_peaks
-from scipy.fft import fft, fftfreq
 from pathlib import Path
+import math
 import os
+import queue
+import sys
+import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
-import warnings
-warnings.filterwarnings('ignore')
 
-from dynamic_baseline import analyze_dynamic_baseline, lowpass_irregular_signal
+from dynamic_baseline import analyze_dynamic_baseline, cycle_extrema, lowpass_irregular_signal
 
 # Set up matplotlib for English
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
+
+RESULTS_DIR_NAME = "thrust_analysis_results"
+SUMMARY_FILE_NAME = "batch_summary.xlsx"
+UI_POLL_INTERVAL_MS = 50
+# A low-pass cutoff below this multiple of the cycle frequency trims stroke peaks.
+HARMONIC_SAFE_CUTOFF_MULTIPLE = 5.0
+
+
+def read_recording_table(file_path):
+    """Read a .csv file as CSV and any other file as an Excel workbook."""
+    if Path(file_path).suffix.lower() == '.csv':
+        return pd.read_csv(file_path)
+    return pd.read_excel(file_path)
+
+
+def parse_optional_seconds(text, *, allow_auto):
+    """Parse a duration field: blank or 'auto' gives None when allowed, else seconds >= 0."""
+    cleaned = str(text).strip().lower()
+    if cleaned in ('', 'auto'):
+        if allow_auto:
+            return None
+        raise ValueError("enter a number of seconds (0 = none)")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        raise ValueError(f"'{text}' is not a number of seconds") from None
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("durations must be finite and non-negative")
+    return value
+
+
+def build_summary_dataframe(results):
+    """Create a numeric summary table with one row per analyzed file."""
+    rows = []
+    for r in results:
+        rows.append({
+            'Folder': r['folder_name'],
+            'Folder_Path': r['source_folder'],
+            'File': r['file_name'],
+            'Duration(s)': round(r['data_duration'], 2),
+            'Cycles': r['num_cycles'],
+            'Forward': r['forward_cycles'],
+            'Backward': r['backward_cycles'],
+            'Mean_Cycle_Force(N)': round(r['mean_cycle_force'], 4),
+            'Std_Cycle_Force(N)': round(r['std_cycle_force'], 4),
+            'Mean_Cycle_Force_TareOnly(N)': round(r['mean_cycle_force_tare_only'], 4),
+            'Mean_Peak_Thrust(N)': round(r['mean_peak_thrust'], 4),
+            'Mean_Recovery_Force(N)': round(r['mean_recovery_force'], 4),
+            'Mean_Peak_to_Valley(N)': round(r['mean_peak_to_valley'], 4),
+            'Std_Peak_to_Valley(N)': round(r['std_peak_to_valley'], 4),
+            'Mean_Impulse(N\u00b7s)': round(r['mean_impulse'], 6),
+            'Total_Impulse(N\u00b7s)': round(r['total_impulse'], 6),
+            'Detected_Period(s)': round(r['detected_period'], 4),
+            'Detected_Frequency(Hz)': round(r['detected_frequency'], 4),
+            'Drift_Model': r['drift_model'],
+            'Tare(N)': round(r['tare_force'], 4),
+            'Tare_Samples': r['tare_samples'],
+            'Baseline_Start(N)': round(r['baseline_start'], 4),
+            'Baseline_End(N)': round(r['baseline_end'], 4),
+            'Baseline_Drift(N)': round(r['baseline_drift'], 4),
+            'Signal': r['signal_description']
+        })
+    return pd.DataFrame(rows)
+
+
+def save_summary_reports(results):
+    """Save one batch summary workbook per source folder and return their paths."""
+    grouped_results = {}
+    for result in results:
+        grouped_results.setdefault(result['source_folder'], []).append(result)
+
+    summary_paths = []
+    for source_folder in sorted(grouped_results):
+        output_dir = Path(source_folder) / RESULTS_DIR_NAME
+        output_dir.mkdir(exist_ok=True)
+        summary_path = output_dir / SUMMARY_FILE_NAME
+        build_summary_dataframe(grouped_results[source_folder]).to_excel(
+            summary_path, index=False, engine='openpyxl'
+        )
+        summary_paths.append(summary_path)
+    return summary_paths
 
 
 class ThrustAnalyzerGUI:
@@ -48,17 +129,22 @@ class ThrustAnalyzerGUI:
         self.file_paths = []
         self.last_output_dirs = []
         self.is_processing = False
+        self.stop_requested = False
         self.detected_sampling_rate = None
+        # Tk is single-threaded: the analysis worker queues UI updates and the
+        # Tk thread applies them in _drain_ui_queue.
+        self._ui_queue = queue.Queue()
+        self._ui_thread = threading.current_thread()
         
-        # Options from data_analysis.py
-        self.auto_mode = tk.BooleanVar(value=True)
-        self.adaptive_period = tk.BooleanVar(value=True)
         self.use_processed_signal = tk.BooleanVar(value=True)
+        self.tare_duration_var = tk.StringVar(value="auto")
+        self.post_rest_var = tk.StringVar(value="0")
         self.file_summary_var = tk.StringVar(value="No files selected yet.")
         self.signal_mode_hint_var = tk.StringVar()
         
         self.configure_styles()
         self.create_widgets()
+        self.root.after(UI_POLL_INTERVAL_MS, self._drain_ui_queue)
 
     def configure_styles(self):
         """Configure ttk styles for a cleaner interface."""
@@ -150,9 +236,8 @@ class ThrustAnalyzerGUI:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # Left Control Panel
-        left_frame = ttk.Frame(self.root, style='Panel.TFrame', padding="16")
-        left_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(14, 8), pady=14)
+        # Left Control Panel (scrollable: it is taller than most screens)
+        left_frame = self.create_scrollable_panel()
         left_frame.columnconfigure(0, weight=1)
         left_frame.columnconfigure(1, weight=1)
         
@@ -214,7 +299,7 @@ class ThrustAnalyzerGUI:
         )
         
         # ========== Section 2: Sampling Rate ==========
-        sr_frame = ttk.LabelFrame(left_frame, text="2. Sampling", padding="12", style='Section.TLabelframe')
+        sr_frame = ttk.LabelFrame(left_frame, text="2. Sampling & Tare", padding="12", style='Section.TLabelframe')
         sr_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=6)
         sr_frame.columnconfigure(1, weight=1)
         
@@ -228,6 +313,24 @@ class ThrustAnalyzerGUI:
             text="The first valid file is used to estimate the sampling interval automatically.",
             style='Muted.TLabel'
         ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+
+        tare_frame = ttk.Frame(sr_frame, style='Panel.TFrame')
+        tare_frame.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ttk.Label(tare_frame, text="Rest before (s)", style='Muted.TLabel').grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(tare_frame, textvariable=self.tare_duration_var, width=7).grid(
+            row=0, column=1, sticky=tk.W, padx=(6, 16)
+        )
+        ttk.Label(tare_frame, text="Rest after (s)", style='Muted.TLabel').grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(tare_frame, textvariable=self.post_rest_var, width=7).grid(
+            row=0, column=3, sticky=tk.W, padx=(6, 0)
+        )
+        ttk.Label(
+            sr_frame,
+            text="'auto' tares on the rest samples logged at the first timestamp. "
+                 "A rest after actuation enables two-point drift correction.",
+            style='Muted.TLabel',
+            wraplength=360
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         
         # ========== Section 3: Cycle Detection (Auto) ==========
         param_frame = ttk.LabelFrame(left_frame, text="3. Cycle Detection", padding="12", style='Section.TLabelframe')
@@ -269,11 +372,12 @@ class ThrustAnalyzerGUI:
                        variable=self.use_processed_signal, value=True).grid(row=2, column=0, columnspan=2, sticky=tk.W)
         ttk.Radiobutton(adv_frame, text="Original Signal", 
                        variable=self.use_processed_signal, value=False).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
-        ttk.Label(adv_frame, textvariable=self.signal_mode_hint_var, style='Muted.TLabel').grid(
+        ttk.Label(adv_frame, textvariable=self.signal_mode_hint_var, style='Muted.TLabel',
+                  wraplength=440).grid(
             row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0)
         )
         
-        # Manual parameters
+        # Low-pass cutoff
         ttk.Label(adv_frame, text="Low-pass Cutoff (Hz)", style='Muted.TLabel').grid(
             row=5, column=0, sticky=tk.W, pady=(12, 4)
         )
@@ -282,7 +386,7 @@ class ThrustAnalyzerGUI:
         self.cutoff_entry.grid(row=5, column=1, sticky=tk.W, padx=5, pady=(12, 4))
         self.cutoff_hint_label = ttk.Label(
             adv_frame,
-            text="Peak detection is automatic. Keep 5.0 Hz unless your motion is much faster.",
+            text="A cutoff at or above the Nyquist frequency switches the filter off.",
             style='Muted.TLabel'
         )
         self.cutoff_hint_label.grid(row=6, column=0, columnspan=2, sticky=tk.W)
@@ -394,11 +498,42 @@ class ThrustAnalyzerGUI:
         self.log("="*70)
         self.log("")
         
-        self.toggle_auto_mode()
-
         self.root.bind('<Control-o>', lambda _event: self.select_single_file())
         self.root.bind('<Control-Return>', lambda _event: self.start_analysis())
         self.root.bind('<Escape>', lambda _event: self.stop_analysis())
+
+    def create_scrollable_panel(self):
+        """Return the left control frame inside a vertically scrolling canvas."""
+        container = ttk.Frame(self.root, style='Panel.TFrame')
+        container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(14, 8), pady=14)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        self.left_canvas = tk.Canvas(
+            container, bg=self.colors['surface'], highlightthickness=0, borderwidth=0
+        )
+        scrollbar = ttk.Scrollbar(container, orient='vertical', command=self.left_canvas.yview)
+        self.left_canvas.configure(yscrollcommand=scrollbar.set)
+        self.left_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+
+        panel = ttk.Frame(self.left_canvas, style='Panel.TFrame', padding="16")
+        window_id = self.left_canvas.create_window((0, 0), window=panel, anchor='nw')
+        panel.bind('<Configure>', lambda _event: self.left_canvas.configure(
+            scrollregion=self.left_canvas.bbox('all'), width=panel.winfo_reqwidth()
+        ))
+        self.left_canvas.bind('<Configure>', lambda event: self.left_canvas.itemconfigure(
+            window_id, width=event.width
+        ))
+        # Wheel scrolling applies only while the pointer is over the panel.
+        container.bind('<Enter>', lambda _event: self.root.bind_all('<MouseWheel>', self._scroll_left_panel))
+        container.bind('<Leave>', lambda _event: self.root.unbind_all('<MouseWheel>'))
+        return panel
+
+    def _scroll_left_panel(self, event):
+        if isinstance(event.widget, tk.Listbox):
+            return
+        self.left_canvas.yview_scroll(int(-event.delta / 120), 'units')
 
     def format_file_display_name(self, file_path):
         """Keep file list entries readable when multiple folders are selected."""
@@ -420,7 +555,8 @@ class ThrustAnalyzerGUI:
         """Explain the currently selected signal mode."""
         if self.use_processed_signal.get():
             self.signal_mode_hint_var.set(
-                "Using the filtered, drift-corrected signal for peak and recovery-force measurement."
+                "Using the low-pass filtered, drift-corrected signal for peak and recovery-force "
+                "measurement (unfiltered when the cutoff is at or above Nyquist)."
             )
         else:
             self.signal_mode_hint_var.set(
@@ -428,7 +564,10 @@ class ThrustAnalyzerGUI:
             )
 
     def set_status(self, text, tone='success', detail=''):
-        """Update the status card consistently."""
+        """Update the status card consistently (safe to call from any thread)."""
+        self._call_in_ui(lambda: self._apply_status(text, tone, detail))
+
+    def _apply_status(self, text, tone, detail):
         tone_map = {
             'success': self.colors['success'],
             'warning': self.colors['warning'],
@@ -438,25 +577,41 @@ class ThrustAnalyzerGUI:
         self.status_label.config(text=text, fg=tone_map.get(tone, self.colors['text']))
         self.status_detail_label.config(text=detail)
     
-    def toggle_auto_mode(self):
-        """Enable/disable manual parameter inputs"""
-        if self.auto_mode.get():
-            self.cutoff_entry.config(state='disabled')
-            self.cutoff_hint_label.config(
-                text="Peak detection is automatic. Keep 5.0 Hz unless your motion is much faster."
-            )
-            self.log("Auto-detection mode enabled")
-        else:
-            self.cutoff_entry.config(state='normal')
-            self.cutoff_hint_label.config(
-                text="Manual mode enabled. Adjust the cutoff only if you need stronger or weaker smoothing."
-            )
-            self.log("Manual parameter mode enabled")
-    
     def log(self, message):
+        """Append a line to the processing log (safe to call from any thread)."""
+        self._call_in_ui(lambda: self._append_log(message))
+    
+    def _append_log(self, message):
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
+
+    def _call_in_ui(self, callback):
+        """Run callback on the Tk thread; other threads queue it for _drain_ui_queue."""
+        if threading.current_thread() is self._ui_thread:
+            callback()
+        else:
+            self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self):
+        """Apply UI updates queued by worker threads, then poll again."""
+        try:
+            while True:
+                try:
+                    callback = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    details = traceback.format_exc()
+                    print(details, file=sys.stderr)
+                    try:
+                        self._append_log("UI update failed:\n" + details)
+                    except tk.TclError:
+                        pass  # the log panel itself is unusable; stderr has the error
+        finally:
+            self.root.after(UI_POLL_INTERVAL_MS, self._drain_ui_queue)
 
     def clear_log(self):
         """Clear the processing log without changing queued files or settings."""
@@ -599,10 +754,7 @@ class ThrustAnalyzerGUI:
         try:
             self.log(f"\nDetecting sampling rate from: {os.path.basename(file_path)}")
             
-            try:
-                df = pd.read_excel(file_path)
-            except:
-                df = pd.read_csv(file_path)
+            df = read_recording_table(file_path)
             
             time_col = None
             for col in df.columns:
@@ -616,8 +768,10 @@ class ThrustAnalyzerGUI:
             time_data = pd.to_numeric(df[time_col], errors='coerce').values
             time_data = time_data[~np.isnan(time_data)]
             
-            if len(time_data) > 1:
-                time_diffs = np.diff(time_data)
+            # Repeated timestamps (the pre-actuation rest block) carry no interval.
+            time_diffs = np.diff(time_data)
+            time_diffs = time_diffs[time_diffs > 0]
+            if time_diffs.size > 0:
                 median_dt = np.median(time_diffs)
                 
                 if median_dt > 0:
@@ -659,10 +813,7 @@ class ThrustAnalyzerGUI:
         self.log("="*70)
         
         try:
-            if file_path.lower().endswith('.csv'):
-                df = pd.read_csv(file_path)
-            else:
-                df = pd.read_excel(file_path)
+            df = read_recording_table(file_path)
             
             time_cols = [c for c in df.columns if 'time' in str(c).lower()]
             thrust_cols = [c for c in df.columns if 'thrust' in str(c).lower() or 'force' in str(c).lower()]
@@ -720,10 +871,11 @@ class ThrustAnalyzerGUI:
         try:
             if self.detected_sampling_rate is None:
                 raise ValueError("Sampling rate not detected.")
-            
-            sampling_rate = self.detected_sampling_rate
             cutoff_freq = float(self.cutoff_freq_var.get())
-                
+            if not math.isfinite(cutoff_freq) or cutoff_freq <= 0.0:
+                raise ValueError("the low-pass cutoff must be a positive frequency")
+            tare_duration_s = parse_optional_seconds(self.tare_duration_var.get(), allow_auto=True)
+            post_rest_duration_s = parse_optional_seconds(self.post_rest_var.get(), allow_auto=False)
         except ValueError as e:
             messagebox.showerror("Error", f"Invalid parameters: {e}")
             return
@@ -731,152 +883,160 @@ class ThrustAnalyzerGUI:
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.is_processing = True
+        self.stop_requested = False
         self.progress.start()
         
+        # Tk variables are read here on the Tk thread; the worker only gets plain values.
         thread = threading.Thread(target=self.run_analysis, args=(
-            sampling_rate, cutoff_freq
+            list(self.file_paths), self.detected_sampling_rate, cutoff_freq,
+            self.use_processed_signal.get(), tare_duration_s, post_rest_duration_s
         ))
         thread.daemon = True
         thread.start()
     
     def stop_analysis(self):
-        self.is_processing = False
+        if not self.is_processing or self.stop_requested:
+            return
+        self.stop_requested = True
+        self.stop_button.config(state="disabled")
+        self.set_status("Stopping...", "warning", "Finishing the current file before stopping.")
+        self.log("\nStop requested; finishing the current file...\n")
+
+    def run_analysis(self, file_paths, sampling_rate, cutoff_freq, use_processed_signal,
+                     tare_duration_s, post_rest_duration_s):
+        """Analyze files on a worker thread; every UI update goes through the UI queue."""
+        all_results = []
+        failed_files = []
+        summary_paths = []
+        error_message = None
+        attempted = 0
+        try:
+            self.set_status("Processing...", "accent", f"Analyzing {len(file_paths)} file(s).")
+
+            self.log("\n" + "="*70)
+            self.log(f"Starting batch analysis - {len(file_paths)} files")
+            self.log("="*70)
+            self.log(f"Sampling rate: {sampling_rate:.2f} Hz")
+            self.log("Cycle period: Auto-detected (FFT)")
+            if tare_duration_s is None:
+                self.log("Rest before actuation: auto (rest samples at the first timestamp)")
+            else:
+                self.log(f"Rest before actuation: {tare_duration_s:g} s")
+            self.log(f"Rest after actuation: {post_rest_duration_s:g} s")
+            self.log("")
+
+            analyzer = ProfessionalThrustAnalyzer(
+                sampling_rate,
+                self.log,
+                use_processed_signal=use_processed_signal,
+                tare_duration_s=tare_duration_s,
+                post_rest_duration_s=post_rest_duration_s
+            )
+
+            for i, file_path in enumerate(file_paths, 1):
+                if self.stop_requested:
+                    break
+                attempted = i
+
+                self.log(f"\n[{i}/{len(file_paths)}] {os.path.basename(file_path)}")
+                self.log("-"*70)
+
+                try:
+                    result = analyzer.analyze_file(file_path, cutoff_freq=cutoff_freq)
+                except Exception as e:
+                    failed_files.append(os.path.basename(file_path))
+                    self.log(f"Error: {e}")
+                    self.log(traceback.format_exc())
+                    continue
+                if result:
+                    all_results.append(result)
+                else:
+                    failed_files.append(os.path.basename(file_path))
+
+            # Finished files are summarized even when the run was stopped early.
+            if all_results:
+                summary_paths = self._save_and_show_results(all_results)
+
+        except Exception as e:
+            error_message = str(e)
+            self.log(f"\nError: {e}")
+            self.log(traceback.format_exc())
+
+        finally:
+            # A stop pressed while the last file was running skipped nothing.
+            stopped = self.stop_requested and attempted < len(file_paths)
+            self._call_in_ui(lambda: self._finish_processing(
+                len(all_results), failed_files, summary_paths, stopped, error_message
+            ))
+
+    def _save_and_show_results(self, all_results):
+        """Write the summary workbooks (worker thread) and queue the result display."""
+        self.log("\n" + "="*70)
+        self.log("Generating summary...")
+        self.log("="*70)
+
+        summary_paths = save_summary_reports(all_results)
+        output_dirs = sorted({path.parent for path in summary_paths}, key=str)
+        average_period = float(np.mean([r['detected_period'] for r in all_results]))
+
+        self.log(f"\n✅ Summary saved for {len(all_results)} file(s):")
+        for summary_path in summary_paths:
+            self.log(f"   - {summary_path}")
+
+        def show_results():
+            self.detected_period_var.set(f"{average_period:.3f} s")
+            self.last_output_dirs = output_dirs
+            self.open_results_button.config(state='normal')
+            self.show_summary(all_results)
+
+        self._call_in_ui(show_results)
+        return summary_paths
+
+    def _finish_processing(self, result_count, failed_files, summary_paths, stopped, error_message):
+        """Restore the controls and report the outcome on the Tk thread."""
         self.progress.stop()
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
-        self.set_status("Stopped", "warning", "Analysis was stopped before completion.")
-        self.log("\nAnalysis stopped\n")
+        self.is_processing = False
+        self.stop_requested = False
     
-    def run_analysis(self, sampling_rate, cutoff_freq):
-        """Run analysis in background thread with auto period detection"""
-        try:
-            self.set_status("Processing...", "accent", f"Analyzing {len(self.file_paths)} file(s).")
+        if error_message:
+            self.set_status("Error", "danger", error_message)
+        elif stopped:
+            saved = "their summary was saved" if result_count else "nothing was saved"
+            self.set_status("Stopped", "warning", f"Stopped after {result_count} analyzed file(s); {saved}.")
+            self.log("\nAnalysis stopped\n")
+        elif not result_count:
+            self.set_status("No results", "warning",
+                            f"All {len(failed_files)} file(s) failed; see the processing log.")
+        else:
+            self._report_completion(result_count, failed_files, summary_paths)
             
-            self.log("\n" + "="*70)
-            self.log(f"Starting batch analysis - {len(self.file_paths)} files")
+    def _report_completion(self, result_count, failed_files, summary_paths):
+        """Announce a finished run, naming every file that could not be analyzed."""
+        if len(summary_paths) == 1:
+            summary_message = f"Summary: {summary_paths[0]}"
+        else:
+            summary_message = f"Saved {len(summary_paths)} summary files (one per source folder)"
+        self.log("\n" + "="*70)
+        if failed_files:
+            self.log(f"⚠️ Analysis complete; {len(failed_files)} file(s) failed: {', '.join(failed_files)}")
             self.log("="*70)
-            self.log(f"Sampling rate: {sampling_rate:.2f} Hz")
-            self.log(f"Cycle period: Auto-detected (FFT)")
-            self.log(f"Auto-detect params: {'ON' if self.auto_mode.get() else 'OFF'}")
-            self.log("")
-            
-            # Create analyzer (always use adaptive period)
-            analyzer = ProfessionalThrustAnalyzer(
-                sampling_rate, 
-                self.log,
-                auto_mode=self.auto_mode.get(),
-                adaptive_period=True,  # Always use FFT
-                use_processed_signal=self.use_processed_signal.get()
+            self.set_status("Complete with errors", "warning",
+                            f"{result_count} file(s) analyzed, {len(failed_files)} failed; see the processing log.")
+            failed_list = "\n".join(failed_files)
+            messagebox.showwarning(
+                "Complete with errors",
+                f"Analyzed {result_count} file(s); {len(failed_files)} failed:\n{failed_list}\n\n{summary_message}"
             )
-            
-            # Analyze each file
-            all_results = []
-            detected_periods = []
-            for i, file_path in enumerate(self.file_paths, 1):
-                if not self.is_processing:
-                    break
-                
-                self.log(f"\n[{i}/{len(self.file_paths)}] {os.path.basename(file_path)}")
-                self.log("-"*70)
-                
-                try:
-                    result = analyzer.analyze_file(
-                        file_path,
-                        cutoff_freq=cutoff_freq
-                    )
-                    if result:
-                        all_results.append(result)
-                        if result.get('detected_period'):
-                            detected_periods.append(result['detected_period'])
-                        
-                except Exception as e:
-                    self.log(f"Error: {e}")
-                    import traceback
-                    self.log(traceback.format_exc())
-            
-            # Update detected period display
-            if detected_periods:
-                avg_period = np.mean(detected_periods)
-                self.detected_period_var.set(f"{avg_period:.3f} s")
-            
-            if self.is_processing and all_results:
-                # Generate summary
-                self.log("\n" + "="*70)
-                self.log("Generating summary...")
-                self.log("="*70)
-                
-                # Create summary DataFrame - ONE ROW PER FILE
-                summary_data = []
-                for r in all_results:
-                    summary_data.append({
-                        'Folder': r.get('folder_name', 'N/A'),
-                        'File': r['file_name'],
-                        'Duration(s)': f"{r['data_duration']:.2f}",
-                        'Cycles': r['num_cycles'],
-                        'Forward': r.get('forward_cycles', 'N/A'),
-                        'Backward': r.get('backward_cycles', 'N/A'),
-                        'Mean_Thrust(N)': f"{r['mean_thrust']:.4f}",
-                        'Mean_Recovery_Force(N)': f"{r['mean_recovery_force']:.4f}",
-                        'Mean_Cycle_Force(N)': f"{r['mean_cycle_force']:.4f}",
-                        'Mean_Net(N)': f"{r['mean_net_thrust']:.4f}",
-                        'Std_Net(N)': f"{r['std_net_thrust']:.4f}",
-                        'Mean_Impulse(N·s)': f"{r.get('mean_impulse', 0):.6f}",
-                        'Total_Impulse(N·s)': f"{r.get('total_impulse', 0):.6f}",
-                        'Detected_Period(s)': f"{r['detected_period']:.3f}" if r.get('detected_period') else 'N/A',
-                        'Detected_Frequency(Hz)': f"{r['detected_frequency']:.4f}",
-                        'Baseline_Drift(N)': f"{r['baseline_drift']:.4f}"
-                    })
-                
-                summary_df = self.build_summary_dataframe(all_results)
-                
-                # Save summary files grouped by source folder
-                summary_paths = self.save_summary_reports(all_results)
-                if len(summary_paths) == 1:
-                    summary_path = summary_paths[0]
-                else:
-                    summary_path = Path(f"{len(summary_paths)} summary files")
-                output_dir = summary_paths[0].parent
-                self.last_output_dirs = sorted({path.parent for path in summary_paths}, key=str)
-                self.open_results_button.config(state='normal')
-                
-                self.log(f"\n✅ Summary saved: {summary_path.name}")
-                self.log(f"   Total files: {len(all_results)}")
-                self.log(f"   Summary files: {len(summary_paths)}")
-                for summary_path in summary_paths:
-                    self.log(f"   - {summary_path}")
-                
-                # Show in results tab
-                self.show_summary(all_results)
-                
-                self.log("\n" + "="*70)
-                self.log("✅ Analysis complete!")
-                self.log("="*70)
-                
-                self.set_status(
-                    "Complete", "success",
-                    f"Finished {len(all_results)} file(s); results saved in {len(self.last_output_dirs)} folder(s)."
-                )
-                if len(summary_paths) == 1:
-                    summary_message = f"Summary: {summary_paths[0]}"
-                else:
-                    summary_message = (
-                        f"Saved {len(summary_paths)} summary files "
-                        f"(one per source folder)"
-                    )
-                messagebox.showinfo("Complete", 
-                    f"Analyzed {len(all_results)} files!\n\n{summary_message}")
-            
-        except Exception as e:
-            self.log(f"\nError: {e}")
-            import traceback
-            self.log(traceback.format_exc())
-            self.set_status("Error", "danger", str(e))
-        
-        finally:
-            self.progress.stop()
-            self.start_button.config(state="normal")
-            self.stop_button.config(state="disabled")
-            self.is_processing = False
+            return
+        self.log("✅ Analysis complete!")
+        self.log("="*70)
+        self.set_status(
+            "Complete", "success",
+            f"Finished {result_count} file(s); results saved in {len(self.last_output_dirs)} folder(s)."
+        )
+        messagebox.showinfo("Complete", f"Analyzed {result_count} files!\n\n{summary_message}")
     
     def show_summary(self, results):
         """Display summary in results tab"""
@@ -885,16 +1045,16 @@ class ThrustAnalyzerGUI:
         
         display_data = []
         for r in results:
-            row = {
-                'File': r.get('file_name', 'N/A'),
-                'Cycles': r.get('num_cycles', 0),
-                'Mean Net(N)': f"{r.get('mean_net_thrust', 0):.4f}",
-                'Mean Cycle Force(N)': f"{r.get('mean_cycle_force', 0):.4f}",
-                'Mean Recovery(N)': f"{r.get('mean_recovery_force', 0):.4f}",
-                'Mean Impulse': f"{r.get('mean_impulse', 0):.6f}",
-                'Detected Period(s)': f"{r.get('detected_period', 0):.3f}" if r.get('detected_period') else 'N/A'
-            }
-            display_data.append(row)
+            display_data.append({
+                'File': r['file_name'],
+                'Cycles': r['num_cycles'],
+                'Mean Force(N)': f"{r['mean_cycle_force']:.4f}",
+                'Tare-only(N)': f"{r['mean_cycle_force_tare_only']:.4f}",
+                'Peak(N)': f"{r['mean_peak_thrust']:.4f}",
+                'Recovery(N)': f"{r['mean_recovery_force']:.4f}",
+                'Peak-Valley(N)': f"{r['mean_peak_to_valley']:.4f}",
+                'Period(s)': f"{r['detected_period']:.3f}"
+            })
         
         summary_df = pd.DataFrame(display_data)
         
@@ -903,76 +1063,29 @@ class ThrustAnalyzerGUI:
         self.result_text.insert(tk.END, header + summary_df.to_string(index=False) + "\n")
         self.notebook.select(1)
 
-    def build_summary_dataframe(self, results):
-        """Create a summary table with one row per analyzed file."""
-        summary_data = []
-        for r in results:
-            summary_data.append({
-                'Folder': r.get('folder_name', 'N/A'),
-                'Folder_Path': r.get('source_folder', 'N/A'),
-                'File': r['file_name'],
-                'Duration(s)': f"{r['data_duration']:.2f}",
-                'Cycles': r['num_cycles'],
-                'Forward': r.get('forward_cycles', 'N/A'),
-                'Backward': r.get('backward_cycles', 'N/A'),
-                'Mean_Thrust(N)': f"{r['mean_thrust']:.4f}",
-                'Mean_Recovery_Force(N)': f"{r['mean_recovery_force']:.4f}",
-                'Mean_Cycle_Force(N)': f"{r['mean_cycle_force']:.4f}",
-                'Mean_Net(N)': f"{r['mean_net_thrust']:.4f}",
-                'Std_Net(N)': f"{r['std_net_thrust']:.4f}",
-                'Mean_Impulse(N路s)': f"{r.get('mean_impulse', 0):.6f}",
-                'Total_Impulse(N路s)': f"{r.get('total_impulse', 0):.6f}",
-                'Detected_Period(s)': f"{r['detected_period']:.3f}" if r.get('detected_period') else 'N/A',
-                'Detected_Frequency(Hz)': f"{r['detected_frequency']:.4f}",
-                'Baseline_Start(N)': f"{r['baseline_start']:.4f}",
-                'Baseline_End(N)': f"{r['baseline_end']:.4f}",
-                'Baseline_Drift(N)': f"{r['baseline_drift']:.4f}"
-            })
-        return pd.DataFrame(summary_data)
 
-    def save_summary_reports(self, results):
-        """Save one batch summary per source folder."""
-        if not results:
-            return []
-
-        grouped_results = {}
-        for result in results:
-            source_folder = result.get('source_folder')
-            if not source_folder:
-                source_folder = str(Path(self.file_paths[0]).parent)
-            grouped_results.setdefault(source_folder, []).append(result)
-
-        summary_paths = []
-        for source_folder in sorted(grouped_results):
-            summary_df = self.build_summary_dataframe(grouped_results[source_folder])
-            output_dir = Path(source_folder) / "thrust_analysis_results"
-            output_dir.mkdir(exist_ok=True)
-            summary_path = output_dir / "batch_summary.xlsx"
-            summary_df.to_excel(summary_path, index=False, engine='openpyxl')
-            summary_paths.append(summary_path)
-
-        return summary_paths
+def _sample_std(values):
+    """Sample standard deviation across cycles (0 for a single cycle)."""
+    return float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
 
 
 class ProfessionalThrustAnalyzer:
     """Professional Thrust Analyzer - Core Algorithm (Unified)"""
     
-    def __init__(self, sampling_rate, log_func=None, auto_mode=True, 
-                 adaptive_period=True, use_processed_signal=False):
+    def __init__(self, sampling_rate, log_func=None, use_processed_signal=True,
+                 tare_duration_s=None, post_rest_duration_s=None):
         self.fs = sampling_rate
         self.dt = 1.0 / sampling_rate
         self.log = log_func if log_func else print
-        self.auto_mode = auto_mode
-        self.adaptive_period = adaptive_period
         self.use_processed_signal = use_processed_signal
+        self.tare_duration_s = tare_duration_s
+        self.post_rest_duration_s = post_rest_duration_s
         self.dynamic_baseline_result = None
+        self.lowpass_description = "not applied"
     
     def load_data(self, file_path):
         """Load data from file"""
-        try:
-            df = pd.read_excel(file_path)
-        except:
-            df = pd.read_csv(file_path)
+        df = read_recording_table(file_path)
         
         # Auto-detect time column
         time_col = None
@@ -1005,80 +1118,15 @@ class ProfessionalThrustAnalyzer:
         
         return t, force_raw
     
-    def auto_detect_parameters(self, y_processed, cycle_period):
-        """Auto-detect optimal parameters based on signal characteristics"""
-        signal_std = np.std(y_processed)
-        signal_max = np.max(np.abs(y_processed))
-        
-        if signal_std > 0:
-            signal_snr = signal_max / signal_std
-        else:
-            signal_snr = 0
-        
-        if signal_snr > 5:
-            prominence_factor = 0.3
-            min_distance_factor = 0.85
-        elif signal_snr > 3:
-            prominence_factor = 0.4
-            min_distance_factor = 0.85
-        elif signal_snr > 2:
-            prominence_factor = 0.5
-            min_distance_factor = 0.85
-        else:
-            prominence_factor = 0.7
-            min_distance_factor = 0.9
-        
-        self.log(f"  Auto-params: SNR={signal_snr:.2f}, prominence={prominence_factor}, distance={min_distance_factor}")
-        
-        return min_distance_factor, prominence_factor
-    
-    def estimate_actual_period(self, t, y_processed, expected_period=None):
-        """Estimate actual period using FFT
-        
-        If expected_period is None, searches the full frequency range.
-        Otherwise, searches within ±50% of the expected frequency.
-        """
-        try:
-            n = len(y_processed)
-            # Remove mean before FFT
-            yf = fft(y_processed - np.mean(y_processed))
-            xf = fftfreq(n, 1/self.fs)
-            
-            positive_freqs = xf[:n//2]
-            positive_power = np.abs(yf[:n//2])
-            
-            nyq = 0.5 * self.fs
-            
-            if expected_period is not None and expected_period > 0:
-                # Search within ±50% of expected frequency
-                f0 = 1.0 / expected_period
-                min_freq = max(0.1, 0.5 * f0)  # At least 0.1 Hz
-                max_freq = min(1.5 * f0, 0.95 * nyq)
-            else:
-                # No hint - search full range (0.1 Hz to Nyquist)
-                # Typical robotic motion is 0.3 - 5 Hz
-                min_freq = 0.1
-                max_freq = min(10.0, 0.95 * nyq)
-            
-            freq_mask = (positive_freqs >= min_freq) & (positive_freqs <= max_freq)
-            if np.any(freq_mask):
-                masked_freqs = positive_freqs[freq_mask]
-                masked_power = positive_power[freq_mask]
-                peak_freq = masked_freqs[np.argmax(masked_power)]
-                estimated_period = 1 / peak_freq if peak_freq > 0 else 1.0
-                return estimated_period
-            else:
-                return 1.0  # Default fallback
-                
-        except Exception as e:
-            self.log(f"  Period estimation failed: {e}")
-            return 1.0  # Default fallback
-    
     def process_signal(self, force_raw, cutoff_freq, t=None):
         """Separate slow sensor drift from the signed periodic force waveform."""
         if t is None:
             t = np.arange(len(force_raw), dtype=float) / self.fs
-        result = analyze_dynamic_baseline(t, force_raw)
+        result = analyze_dynamic_baseline(
+            t, force_raw,
+            tare_duration_s=self.tare_duration_s,
+            post_rest_duration_s=self.post_rest_duration_s
+        )
         self.dynamic_baseline_result = result
         self.fs = result.sampling_rate_hz
         self.dt = 1.0 / self.fs
@@ -1086,210 +1134,89 @@ class ProfessionalThrustAnalyzer:
         force_debiased = np.asarray(result.corrected_force)
 
         self.log(f"  FFT frequency: {result.frequency_hz:.4f} Hz ({result.period_s:.4f} s)")
-        self.log(f"  Pre-actuation baseline anchor: {result.baseline_anchor_n:.4f} N")
+        self.log(f"  Pre-actuation tare: {result.baseline_anchor_n:.4f} N ({result.tare_sample_count} samples)")
+        if result.post_rest_force_n is not None:
+            self.log(f"  Post-run rest: {result.post_rest_force_n:.4f} N")
+        self.log(f"  Drift model: {result.drift_model}")
         baseline_min = np.min(baseline_curve)
         baseline_max = np.max(baseline_curve)
         baseline_drift = baseline_max - baseline_min
         self.log(f"  Baseline range: [{baseline_min:.4f}, {baseline_max:.4f}] N, drift: {baseline_drift:.4f} N")
 
-        nyquist = 0.5 * self.fs
-        # Low-pass filter for noise removal
-        max_cutoff = nyquist * 0.95
-        if cutoff_freq >= max_cutoff:
-            cutoff_freq = max_cutoff * 0.8
-            self.log(f"  Cutoff adjusted to: {cutoff_freq:.2f} Hz")
-        
-        force_filtered = lowpass_irregular_signal(
-            t, force_debiased, self.fs, cutoff_freq
-        )
-        
+        force_filtered = self._lowpass(t, force_debiased, cutoff_freq, result.frequency_hz)
         return force_debiased, force_filtered, baseline_curve
     
-    def detect_cycles_with_fallback(self, t, y_original, y_processed):
-        """Build signed, non-overlapping cycle statistics from the drift result."""
-        result = self.dynamic_baseline_result
-        if result is not None and len(result.corrected_force) == len(t):
-            measurement = y_processed if self.use_processed_signal else y_original
-            thrust_cycles = []
-            for index, (start, stop) in enumerate(
-                zip(result.cycle_boundaries[:-1], result.cycle_boundaries[1:])
-            ):
-                cycle_values = measurement[int(start) : int(stop)]
-                peak_idx = int(start + np.argmax(cycle_values))
-                valley_idx = int(start + np.argmin(cycle_values))
-                peak_val = float(measurement[peak_idx])
-                valley_val = float(measurement[valley_idx])
-                thrust_cycles.append({
-                    'cycle_start_idx': int(start),
-                    'cycle_end_idx': int(stop),
-                    'peak_idx': peak_idx,
-                    'baseline_idx': valley_idx,
-                    'valley_idx': valley_idx,
-                    'peak_value': peak_val,
-                    'baseline_value': valley_val,
-                    'recovery_value': valley_val,
-                    'net_thrust': peak_val - valley_val,
-                    'mean_force': float(result.cycle_mean_forces[index]),
-                    'impulse': float(result.cycle_impulses[index])
-                })
-            self.log(f"  Detected {len(thrust_cycles)} complete, non-overlapping cycles")
-            return thrust_cycles, result.period_s
-        
-        # Auto-detect period using FFT (no user input needed)
-        actual_period = self.estimate_actual_period(t, y_processed, None)
-        self.log(f"  Auto-detected period: {actual_period:.3f}s")
-        
-        # Estimate push/rest duration as half the period each
-        push_duration = actual_period * 0.5
-        rest_duration = actual_period * 0.5
-        
-        # Auto-detect parameters
-        if self.auto_mode:
-            min_dist_factor, prom_factor = self.auto_detect_parameters(y_processed, actual_period)
-        else:
-            min_dist_factor, prom_factor = 0.85, 0.5
-        
-        # Peak detection
-        min_distance_samples = max(1, int(actual_period * min_dist_factor * self.fs))
-        signal_std = np.std(y_processed)
-        prominence_threshold = prom_factor * signal_std
-        
-        peaks, _ = find_peaks(
-            y_processed,
-            prominence=prominence_threshold,
-            distance=min_distance_samples
-        )
-        
-        self.log(f"  Detected {len(peaks)} peaks")
-        
-        # Fallback if too few peaks
-        actual_duration = t.max() - t.min()
-        expected_cycles = max(1, int(actual_duration / actual_period))
-        
-        if len(peaks) < max(2, int(0.6 * expected_cycles)):
-            self.log("  Fallback: state machine detection...")
-            peaks, baselines = self._detect_cycles_state_machine(
-                t, y_processed, push_duration, rest_duration, actual_period
+    def _lowpass(self, t, force_debiased, cutoff_freq, cycle_frequency_hz):
+        """Low-pass the drift-corrected force; a cutoff at or above Nyquist leaves it unchanged."""
+        nyquist = 0.5 * self.fs
+        if cutoff_freq >= nyquist:
+            # No recorded frequency lies above such a cutoff, so any filter would
+            # only remove real signal close to Nyquist.
+            self.lowpass_description = f"low-pass off: cutoff >= Nyquist {nyquist:.2f} Hz"
+            self.log(f"  Low-pass off: cutoff {cutoff_freq:.2f} Hz >= Nyquist {nyquist:.2f} Hz")
+            return np.array(force_debiased, dtype=float, copy=True)
+        self.lowpass_description = f"low-pass {cutoff_freq:.2f} Hz"
+        if cutoff_freq < HARMONIC_SAFE_CUTOFF_MULTIPLE * cycle_frequency_hz:
+            self.log(
+                f"  Warning: cutoff {cutoff_freq:.2f} Hz is below "
+                f"{HARMONIC_SAFE_CUTOFF_MULTIPLE:g}x the cycle frequency; peaks will be attenuated"
             )
-        else:
-            # Find baselines before each peak
-            baselines = []
-            for i, peak_idx in enumerate(peaks):
-                search_start = peaks[i-1] if i > 0 else 0
-                search_end = peak_idx
-                if search_start >= search_end:
-                    baselines.append(max(0, peak_idx - 1))
-                    continue
-                baseline_idx = search_start + np.argmin(y_processed[search_start:search_end])
-                baselines.append(baseline_idx)
-        
-        # Build cycle results
+        return lowpass_irregular_signal(t, force_debiased, self.fs, cutoff_freq)
+
+    def measure_cycles(self, t, y_original, y_processed):
+        """Measure every complete cycle of the recording last passed to process_signal.
+
+        Peaks and recovery valleys come from the selected measurement signal; impulse
+        and mean force always use the unfiltered drift-corrected force.
+        """
+        result = self.dynamic_baseline_result
+        if result is None or len(result.corrected_force) != len(t):
+            raise ValueError("process_signal must run on this recording before measure_cycles")
+        measurement = y_processed if self.use_processed_signal else y_original
+        peaks, valleys = cycle_extrema(result, measurement)
+        boundaries = result.cycle_boundaries
         thrust_cycles = []
-        for i, peak_idx in enumerate(peaks):
-            baseline_idx = baselines[i] if i < len(baselines) else max(0, peak_idx-1)
-            
-            if self.use_processed_signal:
-                peak_val = y_processed[peak_idx]
-                base_val = y_processed[baseline_idx]
-            else:
-                peak_val = y_original[peak_idx]
-                base_val = y_original[baseline_idx]
-            
-            net_thrust = peak_val - base_val
-            
-            if net_thrust > 0:
-                # Calculate impulse for this cycle
-                if i < len(peaks) - 1:
-                    cycle_end = peaks[i+1]
-                else:
-                    cycle_end = len(y_processed)
-                cycle_start = baseline_idx
-                
-                if cycle_end > cycle_start:
-                    impulse = np.trapz(y_processed[cycle_start:cycle_end], t[cycle_start:cycle_end])
-                else:
-                    impulse = 0
-                
-                thrust_cycles.append({
-                    'peak_idx': peak_idx,
-                    'baseline_idx': baseline_idx,
-                    'peak_value': peak_val,
-                    'baseline_value': base_val,
-                    'net_thrust': net_thrust,
-                    'impulse': impulse
-                })
+        for index, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+            peak_val = float(measurement[peaks[index]])
+            valley_val = float(measurement[valleys[index]])
+            thrust_cycles.append({
+                'cycle_start_idx': int(start),
+                'cycle_end_idx': int(stop),
+                'peak_idx': int(peaks[index]),
+                'valley_idx': int(valleys[index]),
+                'peak_value': peak_val,
+                'recovery_value': valley_val,
+                'peak_to_valley': peak_val - valley_val,
+                'mean_force': float(result.cycle_mean_forces[index]),
+                'mean_force_tare_only': float(result.tare_only_cycle_mean_forces[index]),
+                'impulse': float(result.cycle_impulses[index])
+            })
+        self.log(f"  Detected {len(thrust_cycles)} complete, non-overlapping cycles")
+        return thrust_cycles, result.period_s
         
-        return thrust_cycles, actual_period
-    
-    def _detect_cycles_state_machine(self, t, y_proc, push_duration, rest_duration, expected_period):
-        """State machine detection (fallback)"""
-        n = len(y_proc)
-        if n == 0:
-            return np.array([], dtype=int), np.array([], dtype=int)
-        
-        q20 = float(np.quantile(y_proc, 0.20))
-        q80 = float(np.quantile(y_proc, 0.80))
-        upper = q80
-        lower = q20
-        
-        min_on = max(1, int(push_duration * self.fs * 0.5))
-        cooldown = max(1, int(expected_period * self.fs * 0.5))
-        
-        on = False
-        on_start = -1
-        last_off_end = 0
-        peaks = []
-        baselines = []
-        current_peak_idx = None
-        last_peak_idx = -cooldown
-        
-        for i in range(n):
-            val = y_proc[i]
-            if not on:
-                if i > last_off_end:
-                    seg = y_proc[last_off_end:i+1]
-                    baseline_idx = last_off_end + int(np.argmin(seg)) if len(seg) > 0 else last_off_end
-                else:
-                    baseline_idx = last_off_end
-                
-                if val > upper and (i - last_peak_idx) >= cooldown:
-                    on = True
-                    on_start = i
-                    current_peak_idx = i
-                    baselines.append(baseline_idx)
-            else:
-                if current_peak_idx is None or val > y_proc[current_peak_idx]:
-                    current_peak_idx = i
-                
-                if val < lower and (i - on_start) >= min_on:
-                    peaks.append(current_peak_idx)
-                    last_peak_idx = current_peak_idx
-                    on = False
-                    last_off_end = i
-                    current_peak_idx = None
-        
-        if on and current_peak_idx is not None:
-            peaks.append(current_peak_idx)
-        
-        return np.array(peaks, dtype=int), np.array(baselines[:len(peaks)], dtype=int)
+    def _signal_description(self):
+        if self.use_processed_signal:
+            return f"processed ({self.lowpass_description})"
+        return "original (unfiltered)"
     
     def plot_results(self, t, force_raw, force_filtered, cycle_results, 
                     baseline_curve, file_name, output_dir):
         """Plot SVG chart with 6 panels"""
         fig = plt.figure(figsize=(16, 10))
+        force_debiased = force_raw - baseline_curve
         
         # Panel 1: Original + baseline
         ax1 = plt.subplot(3, 2, 1)
         ax1.plot(t, force_raw, 'b-', linewidth=0.8, alpha=0.6, label='Raw')
-        ax1.plot(t, baseline_curve, 'r-', linewidth=2, label='Dynamic sensor baseline')
+        ax1.plot(t, baseline_curve, 'r-', linewidth=2,
+                 label=f'Sensor baseline ({self.dynamic_baseline_result.drift_model})')
         ax1.set_ylabel('Force (N)')
-        ax1.set_title('Raw Data & Dynamic Sensor Baseline')
+        ax1.set_title('Raw Data & Sensor Baseline')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
         # Panel 2: Debiased
         ax2 = plt.subplot(3, 2, 2)
-        force_debiased = force_raw - baseline_curve
         ax2.plot(t, force_debiased, 'g-', linewidth=0.8, alpha=0.6)
         ax2.axhline(y=0, color='k', linestyle=':', alpha=0.5)
         ax2.set_ylabel('Force (N)')
@@ -1301,7 +1228,7 @@ class ProfessionalThrustAnalyzer:
         ax3.plot(t, force_debiased, 'gray', linewidth=0.5, alpha=0.4, label='Debiased')
         ax3.plot(t, force_filtered, 'r-', linewidth=1.5, label='Filtered')
         ax3.set_ylabel('Force (N)')
-        ax3.set_title('Low-Pass Filter')
+        ax3.set_title(f'Low-Pass Filter ({self.lowpass_description})')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         
@@ -1310,23 +1237,26 @@ class ProfessionalThrustAnalyzer:
         noise = force_debiased - force_filtered
         ax4.plot(t, noise, 'orange', linewidth=0.5, alpha=0.7)
         ax4.set_ylabel('Force (N)')
-        ax4.set_title('Removed Noise')
+        ax4.set_title('Removed Noise' if np.any(noise) else 'Removed Noise (none: low-pass off)')
         ax4.grid(True, alpha=0.3)
         
-        # Panel 5: Cycle detection
+        # Panel 5: Cycle detection on the measured signal
         ax5 = plt.subplot(3, 2, 5)
-        ax5.plot(t, force_filtered, 'b-', linewidth=1.5)
+        measurement = force_filtered if self.use_processed_signal else force_debiased
+        ax5.plot(t, measurement, 'b-', linewidth=1.5)
         
         for cycle in cycle_results:
-            peak_idx = cycle['peak_idx']
-            base_idx = cycle['valley_idx']
-            ax5.plot(t[peak_idx], force_filtered[peak_idx], 'ro', markersize=8)
-            ax5.plot(t[base_idx], force_filtered[base_idx], 'mo', markersize=6)
+            ax5.plot(t[cycle['peak_idx']], cycle['peak_value'], 'ro', markersize=8)
+            ax5.plot(t[cycle['valley_idx']], cycle['recovery_value'], 'mo', markersize=6)
         
+        mean_force = float(np.mean([c['mean_force'] for c in cycle_results]))
+        ax5.axhline(y=mean_force, color='g', linestyle='--', linewidth=1.2,
+                    label=f'Mean cycle force {mean_force:.3f} N')
         ax5.axhline(y=0, color='k', linestyle='-', alpha=0.5)
         ax5.set_xlabel('Time (s)')
         ax5.set_ylabel('Force (N)')
         ax5.set_title(f'Cycle Detection (n={len(cycle_results)})')
+        ax5.legend(loc='upper right')
         ax5.grid(True, alpha=0.3)
         
         # Panel 6: Thrust vs Drag
@@ -1339,7 +1269,7 @@ class ProfessionalThrustAnalyzer:
             width = 0.35
             x = np.arange(len(cycle_nums))
             
-            ax6.bar(x - width/2, thrusts, width, label='Thrust', color='green', alpha=0.7)
+            ax6.bar(x - width/2, thrusts, width, label='Peak thrust', color='green', alpha=0.7)
             ax6.bar(x + width/2, recoveries, width, label='Recovery force', color='red', alpha=0.7)
             ax6.axhline(y=0, color='k', linestyle='-', linewidth=1)
             ax6.set_xlabel('Cycle')
@@ -1353,7 +1283,7 @@ class ProfessionalThrustAnalyzer:
         
         svg_path = Path(output_dir) / f"{file_name}_analysis.svg"
         plt.savefig(svg_path, format='svg', dpi=300, bbox_inches='tight')
-        plt.close()
+        plt.close(fig)
         
         return svg_path
     
@@ -1365,15 +1295,15 @@ class ProfessionalThrustAnalyzer:
         
         # Load data
         t, force_raw = self.load_data(file_path)
-        self.log(f"  Data: {len(force_raw)} points, {t[-1]:.2f}s")
+        self.log(f"  Data: {len(force_raw)} points, {t[-1] - t[0]:.2f}s")
         
         # Signal processing
         force_debiased, force_filtered, baseline_curve = self.process_signal(
             force_raw, cutoff_freq, t=t
         )
         
-        # Cycle detection with auto period detection
-        cycle_results, detected_period = self.detect_cycles_with_fallback(
+        # Cycle measurement
+        cycle_results, detected_period = self.measure_cycles(
             t, force_debiased, force_filtered
         )
         
@@ -1382,22 +1312,25 @@ class ProfessionalThrustAnalyzer:
             return None
         
         # Statistics
-        net_thrusts = [c['net_thrust'] for c in cycle_results]
-        impulses = [c['impulse'] for c in cycle_results]
-        peak_values = [c['peak_value'] for c in cycle_results]
-        base_values = [c['baseline_value'] for c in cycle_results]
-        mean_forces = [c['mean_force'] for c in cycle_results]
+        result = self.dynamic_baseline_result
+        cycle_forces = np.array([c['mean_force'] for c in cycle_results])
+        tare_only_forces = np.array([c['mean_force_tare_only'] for c in cycle_results])
+        peak_values = np.array([c['peak_value'] for c in cycle_results])
+        recovery_values = np.array([c['recovery_value'] for c in cycle_results])
+        peak_to_valley = np.array([c['peak_to_valley'] for c in cycle_results])
+        impulses = np.array([c['impulse'] for c in cycle_results])
         
-        forward_cycles = sum(1 for imp in impulses if imp > 0)
+        forward_cycles = int(np.sum(impulses > 0))
         
-        self.log(f"  Detected {len(cycle_results)} cycles")
-        self.log(f"  Mean net thrust: {np.mean(net_thrusts):.4f} N")
-        self.log(f"  Mean cycle force: {np.mean(mean_forces):.4f} N")
-        self.log(f"  Mean signed recovery force: {np.mean(base_values):.4f} N")
+        self.log(f"  Mean cycle force (net thrust): {cycle_forces.mean():.4f} N "
+                 f"(tare only, no drift correction: {tare_only_forces.mean():.4f} N)")
+        self.log(f"  Mean peak thrust: {peak_values.mean():.4f} N")
+        self.log(f"  Mean signed recovery force: {recovery_values.mean():.4f} N")
+        self.log(f"  Mean peak-to-valley: {peak_to_valley.mean():.4f} N")
         self.log(f"  Forward: {forward_cycles}/{len(cycle_results)}")
         
         # Create output directory
-        output_dir = file_path_obj.parent / "thrust_analysis_results"
+        output_dir = file_path_obj.parent / RESULTS_DIR_NAME
         output_dir.mkdir(exist_ok=True)
         
         # Plot SVG
@@ -1411,21 +1344,27 @@ class ProfessionalThrustAnalyzer:
             'file_name': file_name,
             'folder_name': folder_name,
             'source_folder': str(file_path_obj.parent),
-            'data_duration': t[-1],
+            'data_duration': float(t[-1] - t[0]),
             'num_cycles': len(cycle_results),
             'forward_cycles': forward_cycles,
             'backward_cycles': len(cycle_results) - forward_cycles,
-            'mean_thrust': np.mean(peak_values),
-            'mean_drag': np.mean(base_values),
-            'mean_recovery_force': np.mean(base_values),
-            'mean_net_thrust': np.mean(net_thrusts),
-            'mean_cycle_force': np.mean(mean_forces),
-            'std_net_thrust': np.std(net_thrusts),
-            'mean_impulse': np.mean(impulses),
-            'std_impulse': np.std(impulses),
-            'total_impulse': np.sum(impulses),
-            'detected_period': detected_period,
-            'detected_frequency': 1.0 / detected_period,
+            'mean_cycle_force': float(cycle_forces.mean()),
+            'std_cycle_force': _sample_std(cycle_forces),
+            'mean_cycle_force_tare_only': float(tare_only_forces.mean()),
+            'mean_peak_thrust': float(peak_values.mean()),
+            'mean_recovery_force': float(recovery_values.mean()),
+            'mean_peak_to_valley': float(peak_to_valley.mean()),
+            'std_peak_to_valley': _sample_std(peak_to_valley),
+            'mean_impulse': float(impulses.mean()),
+            'std_impulse': _sample_std(impulses),
+            'total_impulse': float(impulses.sum()),
+            'detected_period': float(detected_period),
+            'detected_frequency': 1.0 / float(detected_period),
+            'drift_model': result.drift_model,
+            'tare_force': float(result.baseline_anchor_n),
+            'tare_samples': int(result.tare_sample_count),
+            'post_rest_force': result.post_rest_force_n,
+            'signal_description': self._signal_description(),
             'baseline_start': float(baseline_curve[0]),
             'baseline_end': float(baseline_curve[-1]),
             'baseline_drift': float(np.max(baseline_curve) - np.min(baseline_curve))
